@@ -58,7 +58,7 @@ public class ServerApp {
 		JettyHttpServer server = new JettyHttpServer();
 		server.setHandler(handler);
 		server.setPort(8080);
-		server.afterPropertiesSet();
+		server.initServer();
 		server.start();
 
 		logger.info("Up and running. Enter \"stop\", \"exit\", or \"quit\" to shut down.\n");

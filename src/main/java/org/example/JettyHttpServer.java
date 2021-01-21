@@ -16,76 +16,188 @@
 
 package org.example;
 
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
 import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.server.ServerConnector;
 import org.eclipse.jetty.servlet.ServletContextHandler;
 import org.eclipse.jetty.servlet.ServletHolder;
 import org.eclipse.jetty.websocket.server.config.JettyWebSocketServletContainerInitializer;
 
+import org.springframework.context.Lifecycle;
+import org.springframework.http.server.reactive.ContextPathCompositeHandler;
+import org.springframework.http.server.reactive.HttpHandler;
 import org.springframework.http.server.reactive.JettyHttpHandlerAdapter;
 import org.springframework.http.server.reactive.ServletHttpHandlerAdapter;
+import org.springframework.util.Assert;
+import org.springframework.util.StopWatch;
 
-public class JettyHttpServer extends AbstractHttpServer {
+public class JettyHttpServer implements Lifecycle {
+
+	private static Log logger = LogFactory.getLog(JettyHttpServer.class);
+
 
 	private Server jettyServer;
 
 	private ServletContextHandler contextHandler;
 
+	private String host = "0.0.0.0";
 
-	@Override
-	protected void initServer() throws Exception {
+	private int port = 0;
 
-		this.jettyServer = new Server();
+	private HttpHandler httpHandler;
 
-		ServerConnector connector = new ServerConnector(this.jettyServer);
-		connector.setHost(getHost());
-		connector.setPort(getPort());
-		this.jettyServer.addConnector(connector);
+	private Map<String, HttpHandler> handlerMap;
 
-		ServletHttpHandlerAdapter servlet = createServletAdapter();
-		ServletHolder servletHolder = new ServletHolder(servlet);
-		servletHolder.setAsyncSupported(true);
+	private volatile boolean running;
 
-		this.contextHandler = new ServletContextHandler(this.jettyServer, "", false, false);
-		this.contextHandler.addServlet(servletHolder, "/");
+	private final Object lifecycleMonitor = new Object();
 
-		JettyWebSocketServletContainerInitializer.configure(this.contextHandler, null);
-		this.contextHandler.start();
+
+	public void setHost(String host) {
+		this.host = host;
 	}
 
-	private ServletHttpHandlerAdapter createServletAdapter() {
-		return new JettyHttpHandlerAdapter(resolveHttpHandler());
+	public String getHost() {
+		return host;
 	}
 
-	@Override
-	protected void startInternal() throws Exception {
-		this.jettyServer.start();
-		setPort(((ServerConnector) this.jettyServer.getConnectors()[0]).getLocalPort());
+	public void setPort(int port) {
+		this.port = port;
 	}
 
-	@Override
-	protected void stopInternal() throws Exception {
-		try {
-			if (this.contextHandler.isRunning()) {
-				this.contextHandler.stop();
-			}
+	public int getPort() {
+		return this.port;
+	}
+
+	public void setHandler(HttpHandler handler) {
+		this.httpHandler = handler;
+	}
+
+	public HttpHandler getHttpHandler() {
+		return this.httpHandler;
+	}
+
+	public void registerHttpHandler(String contextPath, HttpHandler handler) {
+		if (this.handlerMap == null) {
+			this.handlerMap = new LinkedHashMap<>();
 		}
-		finally {
-			try {
-				if (this.jettyServer.isRunning()) {
-					this.jettyServer.setStopTimeout(5000);
-					this.jettyServer.stop();
-					this.jettyServer.destroy();
+		this.handlerMap.put(contextPath, handler);
+	}
+
+	public Map<String, HttpHandler> getHttpHandlerMap() {
+		return this.handlerMap;
+	}
+
+	protected HttpHandler resolveHttpHandler() {
+		return (getHttpHandlerMap() != null ?
+				new ContextPathCompositeHandler(getHttpHandlerMap()) : getHttpHandler());
+	}
+
+	public final void initServer() throws Exception {
+		Assert.notNull(this.host, "Host must not be null");
+		Assert.isTrue(this.port >= 0, "Port must not be a negative number");
+		Assert.isTrue(this.httpHandler != null || this.handlerMap != null, "No HttpHandler configured");
+		Assert.state(!this.running, "Cannot reconfigure while running");
+
+		synchronized (this.lifecycleMonitor) {
+			this.jettyServer = new Server();
+
+			ServerConnector connector = new ServerConnector(this.jettyServer);
+			connector.setHost(getHost());
+			connector.setPort(getPort());
+			this.jettyServer.addConnector(connector);
+
+			ServletHttpHandlerAdapter servlet = new JettyHttpHandlerAdapter(resolveHttpHandler());
+			ServletHolder servletHolder = new ServletHolder(servlet);
+			servletHolder.setAsyncSupported(true);
+
+			this.contextHandler = new ServletContextHandler(this.jettyServer, "", false, false);
+			this.contextHandler.addServlet(servletHolder, "/");
+
+			JettyWebSocketServletContainerInitializer.configure(this.contextHandler, null);
+			this.contextHandler.start();
+		}
+	}
+
+	@Override
+	public boolean isRunning() {
+		return this.running;
+	}
+
+	@Override
+	public final void start() {
+		synchronized (this.lifecycleMonitor) {
+			if (!isRunning()) {
+				String serverName = getClass().getSimpleName();
+				if (logger.isDebugEnabled()) {
+					logger.debug("Starting " + serverName + "...");
+				}
+				this.running = true;
+				try {
+					StopWatch stopWatch = new StopWatch();
+					stopWatch.start();
+					this.jettyServer.start();
+					setPort(((ServerConnector) this.jettyServer.getConnectors()[0]).getLocalPort());
+					long millis = stopWatch.getTotalTimeMillis();
+					if (logger.isDebugEnabled()) {
+						logger.debug("Server started on port " + getPort() + "(" + millis + " millis).");
+					}
+				}
+				catch (Throwable ex) {
+					throw new IllegalStateException(ex);
 				}
 			}
-			catch (Exception ex) {
-				// ignore
-			}
 		}
 	}
 
 	@Override
-	protected void resetInternal() {
+	public final void stop() {
+		synchronized (this.lifecycleMonitor) {
+			if (isRunning()) {
+				String serverName = getClass().getSimpleName();
+				logger.debug("Stopping " + serverName + "...");
+				this.running = false;
+				try {
+					StopWatch stopWatch = new StopWatch();
+					stopWatch.start();
+					try {
+						if (this.contextHandler.isRunning()) {
+							this.contextHandler.stop();
+						}
+					}
+					finally {
+						try {
+							if (this.jettyServer.isRunning()) {
+								this.jettyServer.setStopTimeout(5000);
+								this.jettyServer.stop();
+								this.jettyServer.destroy();
+							}
+						}
+						catch (Exception ex) {
+							// ignore
+						}
+					}
+					logger.debug("Server stopped (" + stopWatch.getTotalTimeMillis() + " millis).");
+				}
+				catch (Throwable ex) {
+					throw new IllegalStateException(ex);
+				}
+				finally {
+					reset();
+				}
+			}
+		}
+	}
+
+	private void reset() {
+		this.host = "0.0.0.0";
+		this.port = 0;
+		this.httpHandler = null;
+		this.handlerMap = null;
 		try {
 			if (this.jettyServer.isRunning()) {
 				this.jettyServer.setStopTimeout(5000);
@@ -101,5 +213,4 @@ public class JettyHttpServer extends AbstractHttpServer {
 			this.contextHandler = null;
 		}
 	}
-
 }
